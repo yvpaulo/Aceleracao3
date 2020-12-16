@@ -9,9 +9,11 @@ using Microsoft.EntityFrameworkCore;
 using StorageService.Domain.Core.Interfaces.Service;
 using StorageService.Domain.Services;
 using StorageService.Domain.Core.Interfaces.Repository;
+using StorageService.Domain.Services;
 using AutoMapper;
 using System;
 using FluentValidation.AspNetCore;
+using StorageService.Domain.Core.Entity;
 
 namespace WebAPI
 {
@@ -41,6 +43,7 @@ namespace WebAPI
 
             #region Dependency Injectionn
             services.AddTransient(typeof(IServiceCrud<,>), typeof(GenericServiceCrud<,>));
+            services.AddTransient<IServiceCrud<Guid, Product>, ProductService>();
             services.AddTransient(typeof(IRepositoryCrud<,>), typeof(GenericRepositoryCrud<,>));
             services.AddTransient<IUnitOfWork, UnitOfWork>();
             #endregion
