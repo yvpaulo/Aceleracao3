@@ -328,10 +328,145 @@ A sugestão de considerar `WHERE ft_n_products_used >= 1` para filtrar 11.3M de 
 
 ---
 
-## 9. Parecer Final
+## 9. Refinamento de Escopo: Filtrar por Login com Sucesso?
+
+> *"Para refinamento seria melhor usar só os que têm login com sucesso? Pois quero verificar o comportamento dos usuários ativos no sistema."*
+
+Essa pergunta toca em **dois níveis distintos** que devem ser tratados separadamente:
+
+### 9.1 Nível 1 — Qualidade da Feature de Auth (correção na query)
+
+**Problema atual**: A TEMP VIEW `ft_auth` conta **todos** os eventos de `tb_login` sem filtrar pelo resultado do login:
+
+```sql
+FROM auth_prd.silver.tb_login
+WHERE ts_event >= '${pipeline.dt_360d}'
+GROUP BY cd_uuid
+```
+
+Se `tb_login` registra tanto logins bem-sucedidos quanto falhados (senha errada, conta bloqueada, tentativas de fraude), as features de Auth estão **infladas**. Um usuário com 50 tentativas falhadas e 0 sucessos aparece como se tivesse `ft_auth_login_count_360d = 50` — ou seja, "muito ativo" — quando na realidade **nunca entrou no sistema**.
+
+Isso contamina diretamente:
+- `ft_auth_login_count_{w}d` — inflado por tentativas falhadas
+- `ft_auth_active_days_{w}d` — dias com tentativa ≠ dias com acesso real
+- `ft_auth_rate_{w}d` — taxa de engajamento superestimada
+- `ft_auth_pct_active_days_{w}d` — constância superestimada
+- `ft_auth_trend_ratio` — tendência distorcida
+- `fl_has_auth` — marca como "tem auth" quem nunca conseguiu entrar
+- `ft_n_products_used` — pode contar Auth para quem nunca acessou
+
+**Correção necessária**: Verificar se `tb_login` possui uma coluna de resultado (algo como `status`, `result`, `fl_success`, `ds_status`, `cd_result`) e adicionar filtro:
+
+```sql
+FROM auth_prd.silver.tb_login
+WHERE ts_event >= '${pipeline.dt_360d}'
+  AND status = 'success'  -- ajustar nome/valor conforme schema real
+GROUP BY cd_uuid
+```
+
+**Essa é uma correção de qualidade de dados, independente do escopo populacional.** Deve ser feita mesmo que se mantenha os 93,5M de usuários na tabela.
+
+**Nota**: O login falhado não é informação inútil — pode indicar tentativa de fraude ou atrito. Mas para medir *comportamento no sistema*, só o login bem-sucedido conta. Se no futuro quiser, pode criar uma feature separada como `ft_auth_failed_login_count_{w}d` como sinal de risco/atrito.
+
+### 9.2 Nível 2 — Escopo Populacional (quem entra na clusterização)
+
+Aqui está a decisão estratégica real. O notebook hoje materializa features para os **93,5M de usuários** da spine. A pergunta é: **quem deve entrar na clusterização?**
+
+A análise cross-domain do próprio notebook revelou 4 segmentos:
+
+| Segmento | Usuários | % | Comportamento observável? |
+|---|---|---|---|
+| Auth + Produto | 58,3M | 62,35% | **Sim** — logou E usou produto |
+| Produto sem Auth | 23,9M | 25,59% | **Parcial** — tem dados financeiros mas sem ação digital |
+| Nenhuma interação | 11,3M | 12,05% | **Não** — apenas scores bureau passivos |
+| Auth Only | 21,3K | 0,02% | **Mínimo** — logou sem usar nada |
+
+**Sim, filtrar por login com sucesso é a decisão correta para o objetivo declarado.** Explicação:
+
+#### Por que sim:
+
+1. **Coerência conceitual**: "Comportamento do usuário no sistema" pressupõe que o usuário **entrou** no sistema. Sem login bem-sucedido, não há comportamento digital a medir — apenas dados passivos registrados por terceiros (credores, bureau).
+
+2. **Qualidade dos clusters**: Os 23,9M de "Produto sem Auth" são dominados por eventos passivos de LNO (85,69% desse segmento). Suas features comportamentais serão quase todas NULL/zero, exceto LNO. Eles formariam um **mega-cluster homogêneo** que monopoliza a atenção do algoritmo e comprime os clusters dos usuários genuinamente ativos. Removê-los dá ao algoritmo mais "espaço" para diferenciar os perfis que realmente interessam.
+
+3. **Os 11,3M sem nenhuma interação são ruído puro**: Todas as features comportamentais são NULL. Eles não contribuem com nenhum sinal e diluem a variância das features financeiras.
+
+4. **Escala mais gerenciável**: ~58,3M é grande mas significativamente menor que 93,5M — ganha-se em tempo de processamento e em qualidade de cluster sem perder sinal.
+
+#### Ressalvas importantes:
+
+1. **Não descarte os dados — descarte da clusterização**: A tabela `user_features_ecs_v1` deve continuar com os 93,5M. O filtro é na **entrada da clusterização**, não na materialização. Motivo: os usuários "inativos" hoje podem ativar amanhã, e você vai querer scoreá-los com o modelo de personas sem recomputar tudo.
+
+2. **Os 23,9M "passivos" não são irrelevantes**: Eles representam ~25% da base e são alvos legítimos de campanhas de ativação. Mas para *personas comportamentais*, eles precisam ser tratados como uma população à parte ou simplesmente rotulados como "Persona: Inativo/Passivo" sem passar pelo clustering.
+
+3. **O segmento "Produto sem Auth" merece investigação separada**: 6,4M com eCred sem login e 350K Premium sem login são anomalias que merecem análise para entender se são eventos legítimos (ofertas pré-aprovadas, canais offline) ou problemas de dados.
+
+#### Abordagem recomendada:
+
+```
+Fase 1 (Personas Comportamentais):
+├── População: fl_has_auth = 1 (com login bem-sucedido) → ~58,3M usuários
+├── Features: comportamentais + financeiras
+├── Método: PCA → Clusterização
+└── Resultado: K personas de usuários ativos
+
+Fase 2 (Rotulação dos inativos):
+├── Os ~35,2M restantes recebem label automático:
+│   ├── "Passivo com dívida" → tem LNO mas sem Auth (~20,5M)
+│   ├── "Passivo com interesse em crédito" → tem eCred sem Auth (~6,4M)
+│   └── "Dormante" → nenhuma interação (~11,3M)
+└── Resultado: cobertura total de 93,5M com personas significativas
+```
+
+### 9.3 Cuidado adicional: Login com sucesso altera o `fl_has_auth` e `ft_n_products_used`
+
+Se a query de Auth passar a filtrar por login com sucesso, o flag `fl_has_auth` e consequentemente `ft_n_products_used` mudarão de valor para todos os usuários que só tinham logins falhados. Isso é **desejável** — esses usuários não devem ser contados como "tem auth".
+
+Porém, é preciso revalidar os números de cobertura. A cobertura de Auth provavelmente cairá de 62,37% para algo próximo, mas potencialmente menor se houver um volume significativo de logins puramente falhados. O cruzamento Login × Produto também mudará marginalmente.
+
+---
+
+## 10. Resumo de Ações (atualizado)
+
+### Correções obrigatórias (antes de prosseguir)
+
+| # | Item | Gravidade | Ação |
+|---|---|---|---|
+| 1 | `ft_premium_tenure_days` MIN vs MAX | Alta | Decidir a semântica e corrigir SQL ou documentação |
+| 2 | Trend ratio documentado como ">1" | Média | Corrigir documentação (ponto neutro = 0.083) ou normalizar o ratio multiplicando por 12 |
+| 3 | Labels "HRM4" na validação | Baixa | Trocar por HRP2/HCPA/HCOR |
+| 4 | **Auth: filtrar por login com sucesso** | **Alta** | Adicionar filtro de status na TEMP VIEW `ft_auth` — sem isso, as features de engajamento digital estão infladas e `fl_has_auth` é incorreto |
+
+### Melhorias recomendadas (não bloqueiam próxima fase)
+
+| # | Item | Impacto |
+|---|---|---|
+| 5 | Adicionar `ft_contas_active_days_{w}d` e derivados | Paridade com Auth/LNO, feature útil |
+| 6 | Adicionar `ft_contas_avg_value_{w}d` (ticket médio) | Feature financeira discriminadora |
+| 7 | Padronizar dedup de scores para per-user (QUALIFY ROW_NUMBER) | Robustez contra batches incompletos |
+| 8 | Verificar `dt_load` vs `dt_order` no eCred Ord | Precisão temporal |
+| 9 | Validar mapping `user_id = cd_uuid` em Premium e Seguro | Garantir que o join está correto |
+| 10 | Atualizar catálogo de features para refletir todas as features materializadas | Documentação completa |
+| 11 | Considerar trend ratios separados para eCred Sim e eCred Ord | Granularidade de insights |
+
+### Decisão estratégica (para a próxima fase)
+
+| # | Item | Recomendação |
+|---|---|---|
+| 12 | Escopo da clusterização: toda a base vs login com sucesso | **Filtrar por `fl_has_auth = 1`** para personas comportamentais (~58,3M). Rotular inativos separadamente como personas "Passivo" e "Dormante". Manter tabela de features completa (93,5M) para scoring futuro. |
+
+---
+
+## 11. Parecer Final
 
 O notebook está **bem construído** e demonstra domínio sólido de engenharia de features em Spark SQL. A arquitetura é eficiente, as features são majoritariamente bem escolhidas, e a análise exploratória (cross-domain) gera insights genuínos.
 
-**Os itens #1, #2 e #3 devem ser corrigidos antes de prosseguir para a próxima fase** (seleção de features financeiras + comportamentais), pois o #1 produz dados incorretos e o #2 pode levar a interpretações erradas dos clusters. Os demais itens são melhorias incrementais que podem ser incorporadas na próxima iteração.
+**Os itens #1 a #4 devem ser corrigidos antes de prosseguir para a próxima fase** (seleção de features financeiras + comportamentais):
+- #1 produz dados incorretos (tenure invertido)
+- #2 pode levar a interpretações erradas dos clusters (trend ratio)
+- #3 confunde a documentação (labels errados)
+- #4 infla features de engajamento e distorce o flag `fl_has_auth` (logins falhados contados como atividade)
 
-O trabalho está pronto para avançar para a fase de seleção de features, desde que as três correções obrigatórias sejam aplicadas. A base de ~93,5M usuários com ~130+ features (brutas + derivadas) cobrindo 6 domínios comportamentais e 6 indicadores financeiros é uma fundação robusta para a construção de personas.
+Para a próxima fase de seleção de features: **sim, filtrar a população por login com sucesso é a abordagem correta**, pois garante que a clusterização mede comportamento real de quem de fato acessou o sistema. Os ~35M de inativos/passivos devem ser rotulados à parte, não descartados da tabela de features.
+
+A base de ~58,3M de usuários ativos com ~130+ features cobrindo 6 domínios comportamentais e 6 indicadores financeiros é uma fundação robusta para a construção de personas comportamentais.
